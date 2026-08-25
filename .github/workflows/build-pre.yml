@@ -1,0 +1,724 @@
+name: Build ImmortalWrt XR30
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_daed:
+        description: '启用 daed'
+        required: false
+        default: false
+        type: boolean
+      enable_etherwake:
+        description: '启用 EtherWake (网络唤醒)'
+        required: false
+        default: false
+        type: boolean
+      enable_wireguard:
+        description: '启用 WireGuard'
+        required: false
+        default: false
+        type: boolean
+      enable_nikki:
+        description: '启用 Nikki'
+        required: false
+        default: true
+        type: boolean
+      enable_netspeedtest:
+        description: '启用 netspeedtest'
+        required: false
+        default: true
+        type: boolean
+      enable_easytier:
+        description: '启用 easytier'
+        required: false
+        default: true
+        type: boolean
+      enable_lucky:
+        description: '启用 lucky'
+        required: false
+        default: true
+        type: boolean
+      enable_bandix:
+        description: '启用 Bandix'
+        required: false
+        default: true
+        type: boolean
+      enable_upnp:
+        description: '启用 UPnP'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  REPO_URL: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
+  REPO_BRANCH: openwrt-24.10-6.6
+  CONFIG_URL: https://raw.githubusercontent.com/padavanonly/immortalwrt-mt798x-6.6/refs/heads/openwrt-24.10-6.6/defconfig/mt7981-ax3000.config
+  SOURCE_DIR: immortalwrt
+  TZ: Asia/Shanghai
+
+jobs:
+  build_firmware:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 深度清理磁盘空间
+        run: |
+          echo "🧹 执行深度清理以释放磁盘空间..."
+          docker rmi $(docker images -q) 2>/dev/null || true
+          docker system prune -f 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /etc/mysql /etc/php \
+            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache /usr/local/.ghcup \
+            /usr/local/graalvm /imagegeneration /usr/local/share /opt /var/cache/apt/archives/* \
+            /etc/apt/sources.list.d/* 2>/dev/null || true
+          sudo apt-get -y purge azure-cli* docker* ghc* zulu* hhvm* llvm* firefox* \
+            google* dotnet* aspnetcore* powershell* openjdk* adoptopenjdk* mysql* php* \
+            mongodb* moby* snap* 2>/dev/null || true
+          sudo apt-get autoremove --purge -y && sudo apt-get clean && sudo apt-get autoclean
+          sudo rm -rf /tmp/* /var/tmp/* /var/log/* ~/.cache/* 2>/dev/null || true
+          
+          AVAIL_GB=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
+          echo "💾 可用磁盘空间: ${AVAIL_GB}GB"
+          if [ "$AVAIL_GB" -lt 6 ]; then
+            echo "❌ 磁盘空间不足，需要至少6GB"
+            exit 1
+          fi
+
+      - name: 安装编译依赖
+        run: |
+          echo "📦 安装编译依赖 (使用官方初始化脚本)..."
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh | sudo bash
+          
+          # 设置 ccache
+          echo "📦 设置 ccache..."
+          export PATH="/usr/lib/ccache:$PATH"
+          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          ccache --set-config=max_size=2G
+          ccache --version || true
+
+      - name: 恢复插件配置缓存
+        id: restore-config
+        uses: actions/cache/restore@v4
+        with:
+          path: config/plugins.json
+          key: plugins-config-xr30-latest
+          restore-keys: |
+            plugins-config-xr30-
+
+      - name: 恢复编译缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.SOURCE_DIR }}/dl
+            ${{ env.SOURCE_DIR }}/staging_dir
+            ~/.ccache
+          key: ${{ runner.os }}-build-xr30-${{ env.REPO_BRANCH }}-${{ hashFiles('feeds.conf.default', 'xr30.extra.config') }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-build-xr30-${{ env.REPO_BRANCH }}-${{ hashFiles('feeds.conf.default', 'xr30.extra.config') }}-
+            ${{ runner.os }}-build-xr30-${{ env.REPO_BRANCH }}-
+
+      - name: 设置环境变量
+        id: set-env
+        run: |
+          echo "🔧 设置环境变量..."
+          mkdir -p config
+          
+          echo "🧭 手动触发，优先使用 UI 传入的 inputs"
+          ENABLE_DAED="${{ github.event.inputs.enable_daed || 'false' }}"
+          ENABLE_ETHERWAKE="${{ github.event.inputs.enable_etherwake || 'false' }}"
+          ENABLE_WIREGUARD="${{ github.event.inputs.enable_wireguard || 'false' }}"
+          ENABLE_NIKKI="${{ github.event.inputs.enable_nikki || 'false' }}"
+          ENABLE_NETSPEEDTEST="${{ github.event.inputs.enable_netspeedtest || 'false' }}"
+          ENABLE_EASYTIER="${{ github.event.inputs.enable_easytier || 'false' }}"
+          ENABLE_LUCKY="${{ github.event.inputs.enable_lucky || 'false' }}"
+          ENABLE_BANDIX="${{ github.event.inputs.enable_bandix || 'false' }}"
+          ENABLE_UPNP="${{ github.event.inputs.enable_upnp || 'false' }}"
+          
+          # 确保所有变量都有值（默认为 false）
+          : ${ENABLE_DAED:=false}
+          : ${ENABLE_ETHERWAKE:=false}
+          : ${ENABLE_WIREGUARD:=false}
+          : ${ENABLE_NIKKI:=false}
+          : ${ENABLE_NETSPEEDTEST:=false}
+          : ${ENABLE_EASYTIER:=false}
+          : ${ENABLE_LUCKY:=false}
+          : ${ENABLE_BANDIX:=false}
+          : ${ENABLE_UPNP:=false}
+          
+          # 输出配置到 GITHUB_OUTPUT
+          echo "enable_daed=$ENABLE_DAED" >> $GITHUB_OUTPUT
+          echo "enable_etherwake=$ENABLE_ETHERWAKE" >> $GITHUB_OUTPUT
+          echo "enable_wireguard=$ENABLE_WIREGUARD" >> $GITHUB_OUTPUT
+          echo "enable_nikki=$ENABLE_NIKKI" >> $GITHUB_OUTPUT
+          echo "enable_netspeedtest=$ENABLE_NETSPEEDTEST" >> $GITHUB_OUTPUT
+          echo "enable_easytier=$ENABLE_EASYTIER" >> $GITHUB_OUTPUT
+          echo "enable_lucky=$ENABLE_LUCKY" >> $GITHUB_OUTPUT
+          echo "enable_bandix=$ENABLE_BANDIX" >> $GITHUB_OUTPUT
+          echo "enable_upnp=$ENABLE_UPNP" >> $GITHUB_OUTPUT
+          
+          # 显示最终配置
+          echo "📋 最终使用的配置 (XR30):"
+          echo "• Daed: $ENABLE_DAED"
+          echo "• EtherWake: $ENABLE_ETHERWAKE"
+          echo "• WireGuard: $ENABLE_WIREGUARD"
+          echo "• Nikki: $ENABLE_NIKKI"
+          echo "• NetSpeedTest: $ENABLE_NETSPEEDTEST"
+          echo "• EasyTier: $ENABLE_EASYTIER"
+          echo "• Lucky: $ENABLE_LUCKY"
+          echo "• Bandix: $ENABLE_BANDIX"
+          echo "• UPnP: $ENABLE_UPNP"
+
+      - name: 生成标准数据源 plugins.json
+        run: |
+          mkdir -p config
+          echo "🧾 生成标准 plugins.json (SSOT)"
+          CURRENT_JSON=$(cat << 'EOF'
+          {
+            "enable_daed": "${{ steps.set-env.outputs.enable_daed }}",
+            "enable_etherwake": "${{ steps.set-env.outputs.enable_etherwake }}",
+            "enable_wireguard": "${{ steps.set-env.outputs.enable_wireguard }}",
+            "enable_nikki": "${{ steps.set-env.outputs.enable_nikki }}",
+            "enable_netspeedtest": "${{ steps.set-env.outputs.enable_netspeedtest }}",
+            "enable_easytier": "${{ steps.set-env.outputs.enable_easytier }}",
+            "enable_lucky": "${{ steps.set-env.outputs.enable_lucky }}",
+            "enable_bandix": "${{ steps.set-env.outputs.enable_bandix }}",
+            "enable_upnp": "${{ steps.set-env.outputs.enable_upnp }}"
+          }
+          EOF
+          )
+          # 使用 jq 生成规范的 plugins.json
+          echo "$CURRENT_JSON" | jq '
+            with_entries(select(.key | startswith("enable_"))
+            | .value = (
+                if (.value|type)=="string" then 
+                  (.value | ascii_downcase == "true")
+                else 
+                  .value 
+                end
+              )
+            )' > config/plugins.json
+          echo "✅ plugins.json 已生成"
+          cat config/plugins.json
+
+      - name: 源码和依赖准备
+        run: |
+          # 调试：检查 config 目录
+          echo "🔍 调试：检查 config 目录"
+          ls -R "$GITHUB_WORKSPACE/config" || echo "config 目录不存在"
+
+          # 检查并准备源码
+          if [ ! -d "$SOURCE_DIR" ] || [ ! -d "$SOURCE_DIR/.git" ]; then
+            echo "📥 克隆源码..."
+            rm -rf "$SOURCE_DIR" 2>/dev/null || true
+            git clone -b $REPO_BRANCH --single-branch --depth=1 $REPO_URL $SOURCE_DIR
+          else
+            echo "🔄 检查源码更新..."
+            cd $SOURCE_DIR
+            CURRENT_BRANCH=$(git branch --show-current)
+            if [ "$CURRENT_BRANCH" != "$REPO_BRANCH" ]; then
+              echo "分支不同，重新克隆..."
+              cd ..
+              rm -rf "$SOURCE_DIR"
+              git clone -b $REPO_BRANCH --single-branch --depth=1 $REPO_URL $SOURCE_DIR
+            else
+              git fetch origin $REPO_BRANCH
+              LOCAL_COMMIT=$(git rev-parse HEAD)
+              REMOTE_COMMIT=$(git rev-parse FETCH_HEAD)
+              if [ "$LOCAL_COMMIT" != "$REMOTE_COMMIT" ]; then
+                echo "有更新，重置到最新..."
+                git reset --hard FETCH_HEAD
+              else
+                echo "源码已是最新"
+              fi
+            fi
+            cd ..
+          fi
+
+          # 设置 feeds
+          cd $SOURCE_DIR
+          if [ -f "$GITHUB_WORKSPACE/feeds.conf.default" ]; then
+            cp "$GITHUB_WORKSPACE/feeds.conf.default" ./feeds.conf.default
+          fi
+          
+          # 动态管理 feeds.conf.default
+          # 使用 jq 解析
+          NIKKI_ENABLED=$(jq -r '.enable_nikki // false' "$GITHUB_WORKSPACE/config/plugins.json")
+          if [ "$NIKKI_ENABLED" != "True" ] && [ "$NIKKI_ENABLED" != "true" ]; then
+            echo "🔧 禁用 nikki feed..."
+            sed -i '/src-git nikki/d' feeds.conf.default
+            sed -i '/nikki/d' feeds.conf.default
+          fi
+
+          echo "📋 当前 feeds.conf.default 内容:"
+          cat feeds.conf.default
+
+          echo "🧹 清理 feeds 缓存..."
+          rm -rf tmp/.config* tmp/.packageinfo tmp/.targetinfo tmp/info tmp/.feeds* 2>/dev/null || true
+          
+          # 清理禁用的 feeds
+          [ "$NIKKI_ENABLED" != "true" ] && rm -rf feeds/nikki* package/feeds/nikki 2>/dev/null || true
+          
+          echo "🔄 更新 feeds..."
+          ./scripts/feeds update -a -j $(nproc) || true
+          ./scripts/feeds install -a -f -j $(nproc) || true
+          
+          echo "✅ feeds 处理完成"
+
+      - name: 克隆第三方仓库
+        run: |
+          cd $SOURCE_DIR
+          echo "📥 克隆第三方仓库..."
+          
+          NST_ENABLED=$(jq -r '.enable_netspeedtest // false' "$GITHUB_WORKSPACE/config/plugins.json")
+          if [[ "$NST_ENABLED" == "True" || "$NST_ENABLED" == "true" ]] && [ ! -d "package/netspeedtest" ]; then
+            git clone https://github.com/sirpdboy/netspeedtest.git -b main package/netspeedtest
+          fi
+          
+          LUCKY_ENABLED=$(jq -r '.enable_lucky // false' "$GITHUB_WORKSPACE/config/plugins.json")
+          if [[ "$LUCKY_ENABLED" == "True" || "$LUCKY_ENABLED" == "true" ]] && [ ! -d "package/luci-app-lucky" ]; then
+            git clone https://github.com/gdy666/luci-app-lucky.git -b main package/luci-app-lucky
+          fi
+
+          DAED_ENABLED=$(jq -r '.enable_daed // false' "$GITHUB_WORKSPACE/config/plugins.json")
+          if [[ "$DAED_ENABLED" == "True" || "$DAED_ENABLED" == "true" ]] && [ ! -d "package/dae" ]; then
+            git clone https://github.com/QiuSimons/luci-app-daed.git package/dae
+            # 安装 pnpm (编译前端界面需要)
+            sudo npm install -g pnpm
+          fi
+
+      - name: 下载 Release 软件包并准备自动安装
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd $SOURCE_DIR
+          INSTALL_DIR="files/root/ipks"
+          mkdir -p $INSTALL_DIR
+          mkdir -p files/etc/uci-defaults
+          
+          ET_ENABLED=$(jq -r '.enable_easytier // false' "$GITHUB_WORKSPACE/config/plugins.json")
+          if [[ "$ET_ENABLED" == "True" || "$ET_ENABLED" == "true" ]]; then
+            ET_URL=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/EasyTier/luci-app-easytier/releases/latest | jq -r '.assets[] | select(.name | contains("aarch64_cortex-a53") and contains("22.03.7") and (contains("SNAPSHOT") | not)).browser_download_url // empty' | head -1)
+            if [ -z "$ET_URL" ]; then
+              ET_URL=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/EasyTier/luci-app-easytier/releases/latest | jq -r '.assets[] | select(.name | contains("aarch64_cortex-a53") and (contains("SNAPSHOT") | not)).browser_download_url // empty' | head -1)
+            fi
+            if [ -n "$ET_URL" ]; then
+              wget -qO /tmp/easytier.zip "$ET_URL"
+              unzip -o /tmp/easytier.zip -d $INSTALL_DIR/
+            fi
+          fi
+
+          if [ "$(jq -r '.enable_bandix // false' "$GITHUB_WORKSPACE/config/plugins.json")" = "true" ]; then
+            BD_CORE_URL=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/timsaya/openwrt-bandix/releases/latest | jq -r '.assets[] | select(.name | contains("bandix") and contains("aarch64_cortex-a53") and contains(".ipk")).browser_download_url // empty' | head -1)
+            BD_LUCI_URL=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/timsaya/luci-app-bandix/releases/latest | jq -r '.assets[] | select(.name | contains("luci-app-bandix") and contains(".ipk")).browser_download_url // empty' | head -1)
+            BD_I18N_URL=$(curl -s -H "Authorization: token $GH_TOKEN" https://api.github.com/repos/timsaya/luci-app-bandix/releases/latest | jq -r '.assets[] | select(.name | contains("luci-i18n-bandix-zh-cn") and contains(".ipk")).browser_download_url // empty' | head -1)
+            
+            [ -n "$BD_CORE_URL" ] && wget -P $INSTALL_DIR/ "$BD_CORE_URL"
+            [ -n "$BD_LUCI_URL" ] && wget -P $INSTALL_DIR/ "$BD_LUCI_URL"
+            [ -n "$BD_I18N_URL" ] && wget -P $INSTALL_DIR/ "$BD_I18N_URL"
+          fi
+
+          cat > files/etc/uci-defaults/99-install-custom-ipks << 'EOF'
+          #!/bin/sh
+          if [ -d "/root/ipks" ]; then
+            opkg install /root/ipks/easytier*.ipk
+            opkg install /root/ipks/bandix*.ipk
+            opkg install /root/ipks/luci-app-*.ipk
+            opkg install /root/ipks/luci-i18n-*.ipk
+            rm -rf /root/ipks
+          fi
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-install-custom-ipks
+
+      - name: 修复依赖和补丁
+        run: |
+          cd $SOURCE_DIR
+          echo "🔧 应用补丁和修复依赖..."
+          
+          # 防止删除 .orig 文件
+          sed -i 's/find $targetdir\/ '\''('\'' -name '\''\*.orig'\'' -o -name '\''.\*.orig'\'' '\'')'\'' -exec rm -f {} \\;/echo "Skipping remove .orig files"/' scripts/patch-kernel.sh || true
+          
+          # 禁用 reject 检查
+          sed -i 's/exit 1/echo "Continuing despite rejects"/' scripts/patch-kernel.sh || true
+          
+          # 修复 ebtables
+          EBTABLES_MAKEFILE="package/network/utils/ebtables/Makefile"
+          if [ -f "$EBTABLES_MAKEFILE" ]; then
+            sed -i 's|https://git.netfilter.org/ebtables|https://github.com/netfilter/ebtables.git|g' "$EBTABLES_MAKEFILE"
+            sed -i 's|git://git.netfilter.org/ebtables|https://github.com/netfilter/ebtables.git|g' "$EBTABLES_MAKEFILE"
+            sed -i 's|PKG_MIRROR_HASH:=.*|PKG_MIRROR_HASH:=skip|g' "$EBTABLES_MAKEFILE"
+          fi
+          
+          rm -rf package/feeds/packages/{exim,onionshare-cli,python-zope-event,python-zope-interface,python-gevent,python-twisted} 2>/dev/null || true
+
+          [ -f "package/mtk/drivers/mt_hwifi/Makefile" ] && sed -i 's/+kmod-mt_wifi_osal//g' "package/mtk/drivers/mt_hwifi/Makefile" || true
+          
+      - name: 修改默认LAN IP地址
+        run: |
+          cd $SOURCE_DIR
+          echo "🔧 修改默认LAN IP地址为 192.168.10.1..."
+          sed -i 's/192.168.6.1/192.168.10.1/g' package/base-files/files/bin/config_generate
+
+      - name: 配置构建
+        run: |
+          cd $SOURCE_DIR
+          echo "⚙️ 配置构建选项..."
+          CFG="$GITHUB_WORKSPACE/config/plugins.json"
+
+          # 下载基础配置
+          curl -fsSL "$CONFIG_URL" -o base.config || {
+            [ -f "defconfig/mt7987_mt7992.config" ] && cp defconfig/mt7987_mt7992.config base.config
+          }
+          cat base.config > .config
+
+          # 只构建 CMCC XR30 NAND (U-Boot mod)，避免 base.config 的 multi-profile 产出其它设备固件。
+          sed -i \
+            -e '/^CONFIG_TARGET_mediatek_.*=y/d' \
+            -e '/^# CONFIG_TARGET_mediatek_.* is not set/d' \
+            -e '/^CONFIG_TARGET_MULTI_PROFILE=/d' \
+            -e '/^# CONFIG_TARGET_MULTI_PROFILE is not set/d' \
+            -e '/^CONFIG_TARGET_ALL_PROFILES=/d' \
+            -e '/^# CONFIG_TARGET_ALL_PROFILES is not set/d' \
+            -e '/^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_/d' \
+            -e '/^# CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_/d' \
+            -e '/^CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_/d' \
+            .config
+          echo "CONFIG_TARGET_mediatek=y" >> .config
+          echo "CONFIG_TARGET_mediatek_filogic=y" >> .config
+          echo "# CONFIG_TARGET_MULTI_PROFILE is not set" >> .config
+          echo "# CONFIG_TARGET_ALL_PROFILES is not set" >> .config
+          echo "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_cmcc_xr30-nand=y" >> .config
+
+          echo "🔧 基于 plugins.json 循环生成 .config..."
+          TRUE_KEYS=$(jq -r 'to_entries | map(select(.key | startswith("enable_")) | select(.value == true or .value == "true") | .key) | join(" ")' "$CFG")
+          
+          for key in $TRUE_KEYS; do
+            name="${key#enable_}"
+            case "$name" in
+              easytier) ;;
+              bandix)
+                echo "CONFIG_PACKAGE_zoneinfo-all=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-core=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-europe=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-africa=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-america=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-poles=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-asia=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-atlantic=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-australia-nz=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-pacific=y" >> .config
+                echo "CONFIG_PACKAGE_zoneinfo-indian=y" >> .config
+                echo "CONFIG_PACKAGE_libnetfilter-queue1=y" >> .config
+                echo "CONFIG_PACKAGE_libnetfilter-cttimeout1=y" >> .config
+                echo "CONFIG_PACKAGE_libnetfilter-cthelper0=y" >> .config
+                echo "CONFIG_PACKAGE_conntrack=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
+                echo "CONFIG_PACKAGE_libstdcpp=y" >> .config
+                echo "CONFIG_PACKAGE_libpthread=y" >> .config
+                echo "CONFIG_PACKAGE_librt=y" >> .config
+                ;;
+              daed)
+                echo "CONFIG_PACKAGE_luci-app-daed=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-daed-zh-cn=y" >> .config
+                echo "CONFIG_DEVEL=y" >> .config
+                echo "CONFIG_KERNEL_DEBUG_INFO=y" >> .config
+                echo "CONFIG_KERNEL_DEBUG_INFO_REDUCED=n" >> .config
+                echo "CONFIG_KERNEL_DEBUG_INFO_BTF=y" >> .config
+                echo "CONFIG_KERNEL_CGROUPS=y" >> .config
+                echo "CONFIG_KERNEL_CGROUP_BPF=y" >> .config
+                echo "CONFIG_KERNEL_BPF_EVENTS=y" >> .config
+                echo "CONFIG_BPF_TOOLCHAIN_HOST=y" >> .config
+                echo "CONFIG_KERNEL_XDP_SOCKETS=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-xdp-sockets-diag=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-sched-bpf=y" >> .config
+                echo "CONFIG_KERNEL_BPF=y" >> .config
+                echo "CONFIG_KERNEL_BPF_SYSCALL=y" >> .config
+                echo "CONFIG_KERNEL_BPF_JIT=y" >> .config
+                echo "CONFIG_KERNEL_KPROBES=y" >> .config
+                echo "CONFIG_KERNEL_NET_INGRESS=y" >> .config
+                echo "CONFIG_KERNEL_NET_EGRESS=y" >> .config
+                echo "CONFIG_KERNEL_NET_SCH_INGRESS=m" >> .config
+                echo "CONFIG_KERNEL_NET_CLS_BPF=m" >> .config
+                echo "CONFIG_KERNEL_NET_CLS_ACT=y" >> .config
+                echo "CONFIG_KERNEL_BPF_STREAM_PARSER=y" >> .config
+                echo "CONFIG_KERNEL_KPROBE_EVENTS=y" >> .config
+                ;;
+              etherwake)
+                echo "CONFIG_PACKAGE_luci-app-wol=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-wol-zh-cn=y" >> .config
+                echo "CONFIG_PACKAGE_etherwake=y" >> .config
+                ;;
+              wireguard)
+                echo "CONFIG_PACKAGE_luci-proto-wireguard=y" >> .config
+                echo "CONFIG_PACKAGE_luci-app-wireguard=y" >> .config
+                echo "CONFIG_PACKAGE_wireguard-tools=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-wireguard=y" >> .config
+                ;;
+              nikki)
+                echo "CONFIG_PACKAGE_nikki=y" >> .config
+                echo "CONFIG_PACKAGE_luci-app-nikki=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y" >> .config
+                echo "CONFIG_PACKAGE_ca-bundle=y" >> .config
+                echo "CONFIG_PACKAGE_curl=y" >> .config
+                echo "CONFIG_PACKAGE_yq=y" >> .config
+                echo "CONFIG_PACKAGE_firewall4=y" >> .config
+                echo "CONFIG_PACKAGE_ip-full=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-inet-diag=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-nft-socket=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-nft-tproxy=y" >> .config
+                echo "CONFIG_PACKAGE_kmod-tun=y" >> .config
+                ;;
+              netspeedtest)
+                echo "CONFIG_PACKAGE_luci-app-netspeedtest=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-netspeedtest-zh-cn=y" >> .config
+                ;;
+              lucky)
+                echo "CONFIG_PACKAGE_luci-app-lucky=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-lucky-zh-cn=y" >> .config
+                ;;
+              upnp)
+                echo "CONFIG_PACKAGE_luci-app-upnp=y" >> .config
+                echo "CONFIG_PACKAGE_luci-i18n-upnp-zh-cn=y" >> .config
+                ;;
+              *)
+                echo "CONFIG_PACKAGE_luci-app-${name}=y" >> .config
+                ;;
+            esac
+          done
+
+          # 应用额外配置
+          if [ -f "$GITHUB_WORKSPACE/xr30.extra.config" ]; then
+            cat "$GITHUB_WORKSPACE/xr30.extra.config" >> .config
+          fi
+
+          all_disabled=("luci-theme-bootstrap-mod" "luci-app-wrtbwmon" "wrtbwmon" "luci-app-eqos-mtk" "luci-i18n-eqos-mtk-zh-cn" "luci-app-sms-tool-lite" "luci-app-3ginfo-lite")
+          for pkg in "${all_disabled[@]}"; do
+             sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+             echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          done
+
+          make defconfig
+
+      - name: 上传构建配置 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-configs-xr30
+          path: config/
+          retention-days: 7
+
+      - name: 编译固件
+        run: |
+          cd $SOURCE_DIR
+          THREADS=$(nproc)
+          export PATH="/usr/lib/ccache:$PATH"
+          
+          echo "📥 下载构建依赖..."
+          find dl -size -1024c -delete 2>/dev/null || true
+          make download -j$THREADS V=s || { find dl -size -1024c -delete 2>/dev/null || true; make download -j1 V=s; }
+          
+          echo "🔧 预构建工具链..."
+          [ -d "staging_dir" ] && [ -n "$(ls -A staging_dir 2>/dev/null)" ] && echo "✅ 工具链已缓存" || make toolchain/install -j$THREADS || true
+          
+          echo "🔨 开始编译 (${THREADS} 线程)..."
+          if make -j$THREADS IGNORE_ERRORS=n; then
+            echo "✅ 编译成功"
+          else
+            echo "⚠️ 并行编译失败，尝试单线程调试..."
+            make -j1 V=s || exit 1
+          fi
+
+      - name: 打包产物
+        run: |
+          cd $SOURCE_DIR
+          mkdir -p ../artifacts
+          find bin/targets -type f \( -name "*cmcc_xr30-nand*.bin" -o -name "*cmcc_xr30-nand*.img.gz" -o -name "*-bl2.bin" \) -exec cp {} ../artifacts/ \;
+          cd ..
+          if [ -z "$(find artifacts -type f \( -name '*cmcc_xr30-nand*.bin' -o -name '*cmcc_xr30-nand*.img.gz' \) -print -quit)" ]; then
+            echo "❌ 未找到 cmcc_xr30-nand 固件产物"
+            exit 1
+          fi
+          if find artifacts -type f \( -name '*.bin' -o -name '*.img.gz' \) ! -name '*cmcc_xr30-nand*' ! -name '*-bl2.bin' | grep -q .; then
+            echo "❌ 发现非 cmcc_xr30-nand 固件产物"
+            find artifacts -type f \( -name '*.bin' -o -name '*.img.gz' \) ! -name '*cmcc_xr30-nand*' ! -name '*-bl2.bin'
+            exit 1
+          fi
+          tar -czf artifacts.tar.gz artifacts/
+
+      - name: 动态生成Release信息
+        run: |
+          cd $SOURCE_DIR
+          echo "🎉 **ImmortalWrt XR30 固件已构建完成**" > release_body.md
+          echo "" >> release_body.md
+          echo "📅 时间: ${{ github.event.repository.updated_at }}" >> release_body.md
+          echo "🔗 运行 ID: ${{ github.run_id }}" >> release_body.md
+          echo "" >> release_body.md
+          echo "**⚙️ 启用的功能:**" >> release_body.md
+          
+          jq -r 'to_entries | map(select(.key | startswith("enable_")) | select(.value == true or .value == "true") | .key | sub("^enable_"; "")) | .[]' "$GITHUB_WORKSPACE/config/plugins.json" | awk '
+            {
+              key=$0;
+              if (key=="adguardhome") name="AdGuardHome";
+              else if (key=="openclash") name="OpenClash";
+              else if (key=="nikki") name="Nikki";
+              else if (key=="upnp") name="UPnP";
+              else if (key=="vlmcsd") name="VLMCSd";
+              else if (key=="mosdns") name="MosDNS";
+              else if (key=="dockerman") name="DockerMan";
+              else if (key=="qmodem_next") name="QModem Next";
+              else if (key=="qmodem") name="QModem";
+              else if (key=="mwan") name="MWAN";
+              else if (key=="homeproxy") name="HomeProxy";
+              else if (key=="adbyby_plus") name="Adbyby Plus";
+              else if (key=="original_modem") name="Original Modem";
+              else if (key=="netspeedtest") name="NetSpeedTest";
+              else if (key=="at_webserver") name="AT WebServer";
+              else if (key=="zerotier") name="ZeroTier";
+              else if (key=="watchcat") name="WatchCat";
+              else if (key=="easytier") name="EasyTier";
+              else if (key=="lucky") name="Lucky";
+              else if (key=="bandix") name="Bandix";
+              else if (key=="daed") name="Daed";
+              else if (key=="turboacc") name="TurboACC";
+              else if (key=="eqos_mtk") name="EQOS-MTK";
+              else if (key=="etherwake") name="EtherWake";
+              else if (key=="wireguard") name="WireGuard";
+              else { name=key; gsub(/_/, " ", name); }
+              print "- ✅ " name;
+            }
+          ' >> release_body.md
+          
+          cp release_body.md ../artifacts/
+
+      - name: 验证产物
+        run: |
+          if [ -z "$(ls -A artifacts/ 2>/dev/null)" ]; then
+            echo "❌ 没有找到产物文件"
+            exit 1
+          fi
+          ls -lh artifacts/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-xr30-${{ github.run_number }}
+          path: artifacts.tar.gz
+          retention-days: 30
+
+      - name: 缓存插件配置保存
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: config/plugins.json
+          key: plugins-config-xr30-${{ github.run_id }}
+
+  release:
+    needs: build_firmware
+    runs-on: ubuntu-22.04
+    if: success()
+    steps:
+      - name: 下载构建配置
+        uses: actions/download-artifact@v4
+        with:
+          name: build-configs-xr30
+          path: config
+
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-xr30-${{ github.run_number }}
+
+      - name: 解压产物
+        run: |
+          tar -xzf artifacts.tar.gz
+
+      - name: 收集和上传产物
+        run: |
+          if [ -z "$(ls -A artifacts/ 2>/dev/null)" ]; then
+            echo "❌ 没有找到产物文件"; exit 1
+          fi
+
+          echo "🎉 **ImmortalWrt XR30 固件已构建完成**" > artifacts/release_body.md
+          echo "" >> artifacts/release_body.md
+          echo "📅 时间: $(date '+%Y-%m-%d %H:%M:%S')" >> artifacts/release_body.md
+          echo "🔗 运行 ID: ${{ github.run_id }}" >> artifacts/release_body.md
+          echo "" >> artifacts/release_body.md
+          echo "**⚙️ 启用的功能:**" >> artifacts/release_body.md
+          
+          jq -r 'to_entries | map(select(.key | startswith("enable_")) | select(.value == true or .value == "true") | .key | sub("^enable_"; "")) | .[]' "$GITHUB_WORKSPACE/config/plugins.json" | awk '
+            {
+              key=$0;
+              if (key=="adguardhome") name="AdGuardHome";
+              else if (key=="openclash") name="OpenClash";
+              else if (key=="nikki") name="Nikki";
+              else if (key=="upnp") name="UPnP";
+              else if (key=="vlmcsd") name="VLMCSd";
+              else if (key=="mosdns") name="MosDNS";
+              else if (key=="dockerman") name="DockerMan";
+              else if (key=="qmodem_next") name="QModem Next";
+              else if (key=="qmodem") name="QModem";
+              else if (key=="mwan") name="MWAN";
+              else if (key=="homeproxy") name="HomeProxy";
+              else if (key=="adbyby_plus") name="Adbyby Plus";
+              else if (key=="original_modem") name="Original Modem";
+              else if (key=="netspeedtest") name="NetSpeedTest";
+              else if (key=="at_webserver") name="AT WebServer";
+              else if (key=="zerotier") name="ZeroTier";
+              else if (key=="watchcat") name="WatchCat";
+              else if (key=="easytier") name="EasyTier";
+              else if (key=="lucky") name="Lucky";
+              else if (key=="bandix") name="Bandix";
+              else if (key=="daed") name="Daed";
+              else if (key=="turboacc") name="TurboACC";
+              else if (key=="eqos_mtk") name="EQOS-MTK";
+              else if (key=="etherwake") name="EtherWake";
+              else if (key=="wireguard") name="WireGuard";
+              else { name=key; gsub(/_/, " ", name); }
+              print "- ✅ " name;
+            }
+          ' >> artifacts/release_body.md
+          
+          cat > artifacts/MANIFEST.txt << EOF
+          ╔════════════════════════════════════════════════╗
+          ║    ImmortalWrt XR30 固件构建信息               ║
+          ╚════════════════════════════════════════════════╝
+          📅 构建时间: $(date '+%Y-%m-%d %H:%M:%S')
+          🔗 运行 ID: ${{ github.run_id }}
+          🏷️  Build #: ${{ github.run_number }}
+          EOF
+          
+          echo "" >> artifacts/MANIFEST.txt
+          echo "📦 产物文件:" >> artifacts/MANIFEST.txt
+          cd artifacts
+          ls -lh | grep -v "^total" | awk '{print "  • " $9 " (" $5 ")"}' >> MANIFEST.txt
+
+      - name: 上传构建结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImmortalWrt-XR30-${{ github.run_number }}
+          path: artifacts/
+          retention-days: 30
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: xr30-${{ github.run_number }}
+          name: ImmortalWrt XR30
+          body_path: artifacts/release_body.md
+          files: |
+            artifacts/*.bin
+            artifacts/*.img.gz
+            artifacts/MANIFEST.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
