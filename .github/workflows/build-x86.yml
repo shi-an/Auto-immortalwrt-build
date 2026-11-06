@@ -93,15 +93,15 @@ jobs:
           echo "🧹 执行深度清理以释放磁盘空间..."
           docker rmi $(docker images -q) 2>/dev/null || true
           docker system prune -f 2>/dev/null || true
+          # 仅删除明确无用的工具目录，保留 Runner、Node 和托管工具缓存。
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /etc/mysql /etc/php \
-            /usr/local/share/boost /usr/share/swift /opt/hostedtoolcache /usr/local/.ghcup \
-            /usr/local/graalvm /imagegeneration /usr/local/share /opt /var/cache/apt/archives/* \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
+            /usr/local/graalvm /imagegeneration /var/cache/apt/archives/* \
             /etc/apt/sources.list.d/* 2>/dev/null || true
           sudo apt-get -y purge azure-cli* docker* ghc* zulu* hhvm* llvm* firefox* \
             google* dotnet* aspnetcore* powershell* openjdk* adoptopenjdk* mysql* php* \
             mongodb* moby* snap* 2>/dev/null || true
           sudo apt-get autoremove --purge -y && sudo apt-get clean && sudo apt-get autoclean
-          sudo rm -rf /tmp/* /var/tmp/* /var/log/* ~/.cache/* 2>/dev/null || true
           df -h /
 
       - name: 安装编译依赖
